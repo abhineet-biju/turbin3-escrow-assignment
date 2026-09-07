@@ -36,6 +36,100 @@ fn setup() -> (LiteSVM, Keypair) {
 }
 
 #[test]
+fn test_make_and_update() {
+    let (mut program, payer) = setup();
+    let maker = payer.pubkey();
+
+    // Create the mints and fund the maker's token account.
+    let mint_a = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+    let mint_b = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+    let maker_ata_a = CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_a)
+        .owner(&maker)
+        .send()
+        .unwrap();
+    MintTo::new(&mut program, &payer, &mint_a, &maker_ata_a, 10_000_000)
+        .send()
+        .unwrap();
+
+    let escrow = Pubkey::find_program_address(
+        &[b"escrow", maker.as_ref(), &123u64.to_le_bytes()],
+        &escrowq32026::id(),
+    )
+    .0;
+    let vault = associated_token::get_associated_token_address(&escrow, &mint_a);
+    let now = program
+        .get_sysvar::<anchor_lang::prelude::Clock>()
+        .unix_timestamp;
+
+    // Deposit 10 tokens and ask for 20 tokens in return.
+    let make_ix = Instruction {
+        program_id: escrowq32026::id(),
+        accounts: escrowq32026::accounts::Make {
+            maker,
+            mint_a,
+            mint_b,
+            maker_ata_a,
+            escrow,
+            vault,
+            associated_token_program: ASSOCIATED_TOKEN_PROGRAM_ID,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: escrowq32026::instruction::Make {
+            seed: 123,
+            deposit: 10_000_000,
+            receive: 20_000_000,
+            expiration: now + 3600,
+        }
+        .data(),
+    };
+    let message = Message::new(&[make_ix], Some(&maker));
+    let transaction = Transaction::new(&[&payer], message, program.latest_blockhash());
+    program.send_transaction(transaction).unwrap();
+
+    // Lower the asking amount to 15 tokens and extend the deadline.
+    let update_ix = Instruction {
+        program_id: escrowq32026::id(),
+        accounts: escrowq32026::accounts::Update { maker, escrow }.to_account_metas(None),
+        data: escrowq32026::instruction::Update {
+            receive: 15_000_000,
+            expiration: now + 7200,
+        }
+        .data(),
+    };
+    let message = Message::new(&[update_ix], Some(&maker));
+    let transaction = Transaction::new(&[&payer], message, program.latest_blockhash());
+    let tx = program.send_transaction(transaction).unwrap();
+    msg!("Update transaction successful");
+    msg!("CUs Consumed: {}", tx.compute_units_consumed);
+    msg!("Tx Signature: {}", tx.signature);
+
+    // Verify the new terms and that the deposit stays in the vault.
+    let escrow_account = program.get_account(&escrow).unwrap();
+    let escrow_data =
+        escrowq32026::state::Escrow::try_deserialize(&mut escrow_account.data.as_ref()).unwrap();
+    assert_eq!(escrow_data.receive, 15_000_000);
+    assert_eq!(escrow_data.expiration, now + 7200);
+    assert_eq!(escrow_data.maker, maker);
+    assert_eq!(escrow_data.mint_a, mint_a);
+    assert_eq!(escrow_data.mint_b, mint_b);
+
+    let vault_account = program.get_account(&vault).unwrap();
+    let vault_data = spl_token::state::Account::unpack(&vault_account.data).unwrap();
+    assert_eq!(vault_data.amount, 10_000_000);
+    assert_eq!(vault_data.owner, escrow);
+}
+
+#[test]
 fn test_make_and_refund() {
     // Setup the test environment by initializing LiteSVM and creating a payer keypair
     let (mut program, payer) = setup();
@@ -167,6 +261,120 @@ fn test_make_and_refund() {
     msg!("\n\nRefund transaction sucessful");
     msg!("CUs Consumed: {}", tx.compute_units_consumed);
     msg!("Tx Signature: {}", tx.signature);
+    assert!(program.get_account(&escrow).is_none());
+    assert!(program.get_account(&vault).is_none());
+}
+
+#[test]
+fn test_make_and_take() {
+    let (mut program, payer) = setup();
+    let maker = payer.pubkey();
+    let taker = Keypair::new();
+    program.airdrop(&taker.pubkey(), 1_000_000_000).unwrap();
+
+    // Give the maker 100 token A and the taker 100 token B.
+    let mint_a = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+    let mint_b = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+    let maker_ata_a = CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_a)
+        .owner(&maker)
+        .send()
+        .unwrap();
+    let taker_ata_b = CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_b)
+        .owner(&taker.pubkey())
+        .send()
+        .unwrap();
+    MintTo::new(&mut program, &payer, &mint_a, &maker_ata_a, 100_000_000)
+        .send()
+        .unwrap();
+    MintTo::new(&mut program, &payer, &mint_b, &taker_ata_b, 100_000_000)
+        .send()
+        .unwrap();
+
+    let escrow = Pubkey::find_program_address(
+        &[b"escrow", maker.as_ref(), &123u64.to_le_bytes()],
+        &escrowq32026::id(),
+    )
+    .0;
+    let vault = associated_token::get_associated_token_address(&escrow, &mint_a);
+    let now = program
+        .get_sysvar::<anchor_lang::prelude::Clock>()
+        .unix_timestamp;
+
+    // Offer 10 token A in exchange for 20 token B.
+    let make_ix = Instruction {
+        program_id: escrowq32026::id(),
+        accounts: escrowq32026::accounts::Make {
+            maker,
+            mint_a,
+            mint_b,
+            maker_ata_a,
+            escrow,
+            vault,
+            associated_token_program: ASSOCIATED_TOKEN_PROGRAM_ID,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: escrowq32026::instruction::Make {
+            seed: 123,
+            deposit: 10_000_000,
+            receive: 20_000_000,
+            expiration: now + 3600,
+        }
+        .data(),
+    };
+    let message = Message::new(&[make_ix], Some(&maker));
+    let transaction = Transaction::new(&[&payer], message, program.latest_blockhash());
+    program.send_transaction(transaction).unwrap();
+
+    // The taker accepts; take creates the two receiving token accounts.
+    let taker_ata_a = associated_token::get_associated_token_address(&taker.pubkey(), &mint_a);
+    let maker_ata_b = associated_token::get_associated_token_address(&maker, &mint_b);
+    let take_ix = Instruction {
+        program_id: escrowq32026::id(),
+        accounts: escrowq32026::accounts::Take {
+            taker: taker.pubkey(),
+            maker,
+            mint_a,
+            mint_b,
+            taker_ata_a,
+            taker_ata_b,
+            maker_ata_b,
+            escrow,
+            vault,
+            associated_token_program: ASSOCIATED_TOKEN_PROGRAM_ID,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: escrowq32026::instruction::Take {}.data(),
+    };
+    let message = Message::new(&[take_ix], Some(&taker.pubkey()));
+    let transaction = Transaction::new(&[&taker], message, program.latest_blockhash());
+    let tx = program.send_transaction(transaction).unwrap();
+    msg!("Take transaction successful");
+    msg!("CUs Consumed: {}", tx.compute_units_consumed);
+    msg!("Tx Signature: {}", tx.signature);
+
+    // Check both sides of the swap and account closure.
+    for (address, expected_amount) in [
+        (maker_ata_a, 90_000_000),
+        (maker_ata_b, 20_000_000),
+        (taker_ata_a, 10_000_000),
+        (taker_ata_b, 80_000_000),
+    ] {
+        let account = program.get_account(&address).unwrap();
+        let data = spl_token::state::Account::unpack(&account.data).unwrap();
+        assert_eq!(data.amount, expected_amount, "Wrong balance for {address}");
+    }
     assert!(program.get_account(&escrow).is_none());
     assert!(program.get_account(&vault).is_none());
 }
